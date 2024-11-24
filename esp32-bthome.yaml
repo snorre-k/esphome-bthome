@@ -1,0 +1,54 @@
+packages:
+  button: !include common/bthome-button-lambda.yaml
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  hardware_uart: UART1
+
+
+# Global Variables
+globals:
+  # BTHome MACs, Encryption Keys and Global Counter Indexes
+  # e.g. 2 Devices:
+      #{
+      #  {"AA:BB:CC:11:22:33", { "BTHome_hex_secret_1", 0}},
+      #  {"CC:BB:AA:22:33:11", { "BTHome_hex_secret_2", 1}}
+      #}
+  - id: bthome_sensor_keys
+    type: std::map<std::string, std::tuple<std::string, int>>
+    initial_value: !secret shelly_blu_button1_keys
+
+  # please change global_enc_counter[x] for each BTHome device
+  - id: global_enc_counter
+    type: uint32_t[2]
+    restore_value: yes
+
+
+output:
+  - platform: gpio
+    pin:
+      number: 1
+      inverted: true
+    id: relay
+
+
+button:
+  - platform: output
+    name: "Relay"
+    output: relay
+    duration: 0.5
+    id: button_test
+
+# Define your actions on a button press here in the lambda
+script:
+  - id: bthome_button_script
+    parameters:
+      button_action: int
+    then:
+      - lambda: |-
+          if (button_action == 0x01) { id(button_test).press(); }
+          //else if (button_action == 0x02) { id(button_test2).press(); }

@@ -1,0 +1,353 @@
+esphome:
+  includes:
+    - common/inc_ccm.h
+
+switch:
+  # Debug Switch (Config)
+  - platform: template
+    name: "Debug Log Switch"
+    entity_category: CONFIG
+    lambda: |-
+      if (id(debug_switch)) {
+        return true;
+      } else {
+        return false;
+      }
+    turn_on_action:
+      - globals.set:
+          id: debug_switch
+          value: "true"
+    turn_off_action:
+      - globals.set:
+          id: debug_switch
+          value: "false"
+    restore_mode: DISABLED
+
+  # Allow Unencrypted BTHome Messages
+  - platform: template
+    name: "Allow Unencrypted BTHome"
+    entity_category: CONFIG
+    lambda: |-
+      if (id(uenc_switch)) {
+        return true;
+      } else {
+        return false;
+      }
+    turn_on_action:
+      - globals.set:
+          id: uenc_switch
+          value: "true"
+    turn_off_action:
+      - globals.set:
+          id: uenc_switch
+          value: "false"
+    restore_mode: DISABLED
+
+
+# Global Variables - please change global_enc_counter[x] for each BTHome device
+globals:
+  - id: global_bthome_pid
+    type: int
+
+  - id: debug_switch
+    type: bool
+
+  - id: uenc_switch
+    type: bool
+    restore_value: yes
+
+button:
+  # Reset Enc Counters Button
+  - platform: template
+    name: "Reset Enc. Counters"
+    entity_category: CONFIG
+    on_press:
+      - lambda: |-
+          // specify reset value
+          uint32_t reset_value = 0;
+          for (int i = 0; i < sizeof(id(global_enc_counter)) / sizeof(id(global_enc_counter)[0]); i++) {
+            ESP_LOGI("ble_decrypt", "Setting enc. counter [%i] from %i to %i", i, id(global_enc_counter)[i], reset_value);
+            id(global_enc_counter)[i] = reset_value;
+          }
+
+
+esp32_ble_tracker:
+  id: ble_tracker
+  on_ble_advertise:
+      then:
+        - lambda: |-
+            // Debug - Log BLE Adv.
+            if (id(debug_switch)) {
+              ESP_LOGD("ble_adv_debug", "BLE device advertisement");
+              ESP_LOGD("ble_adv_debug", "  address: %s", x.address_str().c_str());
+              ESP_LOGD("ble_adv_debug", "  name: %s", x.get_name().c_str());
+
+              ESP_LOGD("ble_adv_debug", "  Advertised service UUIDs:");
+              for (auto uuid : x.get_service_uuids()) {
+                  ESP_LOGD("ble_adv_debug", "    - %s", uuid.to_string().c_str());
+              }
+
+              ESP_LOGD("ble_adv_debug", "  Advertised manufacturer data:");
+              for (auto data : x.get_manufacturer_datas()) {
+                  ESP_LOGD("ble_adv_debug", "    - %s: (length %i) - %s", data.uuid.to_string().c_str(), data.data.size(), format_hex_pretty(data.data).c_str());
+              }
+
+              ESP_LOGD("ble_adv_debug", "  Advertised service data:");
+              for (auto data : x.get_service_datas()) {
+                  ESP_LOGD("ble_adv_debug", "    - %s: (length %i) - %s", data.uuid.to_string().c_str(), data.data.size(), format_hex_pretty(data.data).c_str());
+              }
+            }
+
+
+            // Process messages
+            for (auto sd : x.get_service_datas()) {
+              // Check if it is BTHome (uuid is 0xFCD2)
+              if ( sd.uuid.to_string() == "0xFCD2" ) {
+                // Check if message is encrypted
+                int enc = (sd.data[0] >> 0) & 1; // we get bit 0 (>>0) from the first byte of service_data (x[0])
+                if (id(debug_switch)) {
+                  ESP_LOGD("ble_adv", "BTHome adv. detected");
+                  ESP_LOGD("ble_adv", " - data: %s - length %i", format_hex_pretty(sd.data).c_str(), sd.data.size() );
+                  ESP_LOGD("ble_adv", " - encrypted: %i", enc);
+                }
+
+                // Check if unencrypted messages are allowed --> return when message is not encrypted (enc==0) and unencrypted messages are not allowed
+                if ((enc == 0) && !id(uenc_switch)) {
+                  if (id(debug_switch)) {
+                    ESP_LOGW("ble_adv", "Clear Text Messages not allowed");
+                  }
+                  return;
+                }
+
+                // prepare vars for decryption
+                auto mac = x.address();
+                auto mac_string = x.address_str();
+                const uint8_t *data = sd.data.data()+1;
+                size_t data_len;
+
+
+                // Decrypt message
+                if (enc == 1) {
+                  auto x = sd.data;  // data sent by BT
+                  uint8_t cleartext[x.size()];  // Cleartext
+
+                  // Get BTHome keys  & counter from global map variable bthome_sensor_keys (mac <-> key(0),counter_number(1))
+                  // if there is no entry for the mac defined then stop processing
+                  if (id(bthome_sensor_keys).find(mac_string) == id(bthome_sensor_keys).end()) {
+                    ESP_LOGE("ble_decrypt", "BThome settings for mac %s not found",mac_string.c_str());
+                    return;
+                  }
+
+                  // Check Encryption counter to prevent replay attacks
+                  size_t startIndex = x.size() - 8; // Counter starts on the 8th byte from the end and is 4 byte long (32 bit)
+                  uint32_t enc_counter = *reinterpret_cast<uint32_t*>(&x[startIndex]);
+                  if (id(debug_switch)) {
+                    ESP_LOGD("ble_adv", " - MAC: %s - enc counter: %i", mac_string.c_str(), enc_counter);
+                  }
+
+                  // Get index number of device
+                  int device_index = std::get<1>(id(bthome_sensor_keys)[mac_string]);
+
+                  // Check and set global enc counter
+                  if (enc_counter <= id(global_enc_counter)[device_index]) {
+                    if (id(debug_switch)) {
+                      ESP_LOGW("ble_decrypt", "Replay with counter %i <= %i detected", enc_counter, id(global_enc_counter)[device_index]);
+                    }
+                    return;
+                  }
+                  ESP_LOGI("BTHome", "updated enc counter seen for %s and set to global: %i -> %i", mac_string.c_str(), id(global_enc_counter)[device_index], enc_counter);
+                  id(global_enc_counter)[device_index] = enc_counter;
+
+                  // Get key
+                  auto btkey = std::get<0>(id(bthome_sensor_keys)[mac_string]);
+                  // convert key string to uint8_t array needed by AES decryption object
+                  if (btkey.length() % 2 != 0) {
+                    ESP_LOGE("ble_decrypt", "BThome key %s has odd size",btkey.c_str());
+                    return;
+                  }
+                  std::vector<uint8_t> bthome_sensor_key_vec;
+                  for (size_t i = 0; i < btkey.length(); i += 2) {
+                      std::string byteString = btkey.substr(i, 2);
+                      uint8_t byte = static_cast<uint8_t>(std::stoi(byteString, nullptr, 16));
+                      bthome_sensor_key_vec.push_back(byte);
+                  }
+                  uint8_t* bthome_sensor_key = bthome_sensor_key_vec.data(); 
+
+                  // initialize decryption object with key
+                  mbedtls_ccm_context ctx;
+                  mbedtls_ccm_init(&ctx);
+                  int ret = mbedtls_ccm_setkey(&ctx, MBEDTLS_CIPHER_ID_AES, bthome_sensor_key, 16 * 8);
+                  if (ret) {
+                    ESP_LOGE("ble_decrypt", "mbedtls_ccm_setkey() failed: %04x", ret);
+                    mbedtls_ccm_free(&ctx);
+                    return;
+                  }
+
+                  // Create the nonce:
+                  //   MAC 6 bytes
+                  //   UUID 4 bytes
+                  //   Device data 1 byte
+                  //   Counter 4 bytes
+                  uint8_t nonce[13];
+                  memcpy(nonce, mac, 6); // Copy MAC address to beginning of nonce (should be 6 although sizeof only shows 4)
+                  // UUID
+                  nonce[6] = 0xD2;
+                  nonce[7] = 0xFC;
+                  // Device Data
+                  nonce[8] = x[0];
+                  // Counter
+                  nonce[9] =  x[x.size()-8];
+                  nonce[10] = x[x.size()-7];
+                  nonce[11] = x[x.size()-6];
+                  nonce[12] = x[x.size()-5];
+                  // MIC - message integrity checksum
+                  uint8_t tag[4];
+                  tag[0] = x[x.size()-4];
+                  tag[1] = x[x.size()-3];
+                  tag[2] = x[x.size()-2];
+                  tag[3] = x[x.size()-1];
+                  if (id(debug_switch)) {
+                    ESP_LOGD("ble_decrypt_debug", "nonce:   %s",format_hex_pretty(nonce,sizeof(nonce)).c_str());
+                    ESP_LOGD("ble_decrypt_debug", "tag:     %s",format_hex_pretty(tag,sizeof(tag)).c_str());
+                    ESP_LOGD("ble_decrypt_debug", "counter: %i", enc_counter);
+                  }
+
+                  // Decrypt
+                  ret = mbedtls_ccm_auth_decrypt(&ctx, x.size()-9, nonce, 13, NULL, 0, x.data()+1, cleartext, tag, 4);
+                  if (ret != 0) {
+                    ESP_LOGE("ble_decrypt", "mbedtls_ccm_auth_decrypt() failed: %04x", ret);
+                    mbedtls_ccm_free(&ctx);
+                    return;
+                  }
+
+                  // Cleanup
+                  mbedtls_ccm_free(&ctx);
+
+                  data = cleartext;
+                  data_len = x.size()-9;
+                  if (id(debug_switch)) {
+                    ESP_LOGD("ble_decrypt_debug", "decrypted: %s - length %i", format_hex_pretty(data,data_len).c_str(), data_len );
+                  }
+                }
+
+
+                // create service data vector
+                std::vector<uint8_t> service_data_dec;
+                if (enc == 0) {
+                  service_data_dec = sd.data;
+                } else if (enc == 1) {
+                  service_data_dec.push_back(sd.data[0]);
+                  service_data_dec.insert(service_data_dec.begin() + 1, data, data + data_len);
+                }
+                if (id(debug_switch)) {
+                  ESP_LOGD("ble_adv", " - service_data: %s - length %i", format_hex_pretty(service_data_dec).c_str(), service_data_dec.size());
+                }
+
+
+                // Process decrypted message
+                int pid = 0;
+                int button = 0;
+                // Check Data comming from BTHome
+                for (int i=1; i<service_data_dec.size(); i++) {
+                  switch(service_data_dec[i]) {
+                  case 0x00:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - pid: %i", service_data_dec[i+1]);
+                    }
+                    i += 1; // = { n: "pid", t: uint8 };
+                    pid = service_data_dec[i];
+                    break;
+                  case 0x01:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - battery: %i", service_data_dec[i+1]);
+                    }
+                    i += 1; // = { n: "battery", t: uint8, u: "%" };
+                    break;
+                  case 0x02:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - temperature: %02x%02x", service_data_dec[i+2], service_data_dec[i+1]);
+                    }
+                    i += 2; // = { n: "temperature", t: int16, f: 0.01, u: "tC" };
+                    break;
+                  case 0x03:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - humidity: %02x%02x", service_data_dec[i+2], service_data_dec[i+1]);
+                    }
+                    i += 2; // = { n: "humidity", t: uint16, f: 0.01, u: "%" };
+                    break;
+                  case 0x05:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - illuminance: %02x%02x%02x", service_data_dec[i+3], service_data_dec[i+2], service_data_dec[i+1]);
+                    }
+                    i += 3; // = { n: "illuminance", t: uint24, f: 0.01 };
+                    break;
+                  case 0x21:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - motion: %02x", service_data_dec[i+1]);
+                    }
+                    i += 1; // = { n: "motion", t: uint8 };
+                    break;
+                  case 0x2d:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - door/window: %02x", service_data_dec[i+1]);
+                    }
+                    i += 1; // = { n: "door/window", t: uint8 };
+                    break;
+                  case 0x3a:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - button: %02x", service_data_dec[i+1]);
+                    }
+                    i += 1; // = { n: "button", t: uint8 };
+                    button = service_data_dec[i];
+                    break;
+                  case 0x3f:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - rotation: %02x%02x", service_data_dec[i+2], service_data_dec[i+1]);
+                    }
+                    i += 2; // = { n: "rotation", t: int16, f: 0.1 };
+                    break;
+                  default:
+                    if (id(debug_switch)) {
+                      ESP_LOGD("ble_adv", " - unknow");
+                    }
+                    break;
+                  }
+                }
+
+
+                // Check PID (same message can be sent more than once)
+                if (id(debug_switch)) {
+                  ESP_LOGD ("ble_adv", "   - global pid: %i", id(global_bthome_pid));
+                  ESP_LOGD ("ble_adv", "   - pid: %i", pid);
+                }
+                if (pid != id(global_bthome_pid) && pid != 0) {
+                  // PID not seen so far - log & set global var
+                  ESP_LOGI("BTHome", "new PID seen and set to global: %i -> %i", id(global_bthome_pid), pid);
+                  id(global_bthome_pid) = pid;
+
+                  // Log Button presses (when button was invoked)
+                  switch (button) {
+                    case 0x01:
+                      ESP_LOGI("BTHome", "Enc=%i - Single Button press",enc);
+                      break;
+                    case 0x02:
+                      ESP_LOGI("BTHome", "Enc=%i - Double Button press",enc);
+                      break;
+                    case 0x03:
+                      ESP_LOGI("BTHome", "Enc=%i - Tripple Button press",enc);
+                      break;
+                    case 0x04:
+                      ESP_LOGI("BTHome", "Enc=%i - Long Button press",enc);
+                      break;
+                    case 0xFE:
+                      ESP_LOGI("BTHome", "Enc=%i - Button Hold",enc);
+                      break;
+                  }
+
+                  // Call Button Script (when button was invoked)
+                  if (button != 0) {
+                    id(bthome_button_script)->execute(button);
+                  }
+                }
+              }
+            }
